@@ -1,6 +1,7 @@
 export type Usage = {
   rateLimits: { kind: string; percentUsed: number; resetsAt?: string }[]
   usd: number | null
+  monthUsd: number | null
 }
 
 declare module 'claude-code' {

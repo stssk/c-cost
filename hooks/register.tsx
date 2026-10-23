@@ -20,15 +20,44 @@ const EMPTY = '░'
 const filled = (pct: number) => Math.min(BAR, Math.max(0, Math.round((pct / 100) * BAR)))
 const barColor = (pct: number) => (pct >= 90 ? 'error' : pct >= 70 ? 'warning' : 'success')
 
+const bar = (pct: number) => ({ full: FULL.repeat(filled(pct)), empty: EMPTY.repeat(BAR - filled(pct)), color: barColor(pct) })
+
 const usd = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`
 
-const save = ($: EngineInterface, rateLimits: SessionRateLimit[], cost: SessionCost | undefined) =>
-  update($, usage, (): Usage => ({
+type Month = { sessions: Record<string, number> }
+
+const monthKey = (now: number) => {
+  const d = new Date(now)
+  return `month:${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+// Each session's cost is cumulative, so it is kept per session id and the
+// month is their sum: a session measured twice is never counted twice.
+const recordMonth = async ($: EngineInterface, usd: number) => {
+  const key = monthKey(await $.clock.now())
+  const month = ((await $.store.get(key)) as Month | undefined) ?? { sessions: {} }
+  month.sessions[await $.session.id()] = usd
+  await $.store.set(key, month)
+  return Object.values(month.sessions).reduce((a, b) => a + b, 0)
+}
+
+// Subscription windows; any other window (a spend limit) means the USD is real.
+const isSubscription = (rateLimits: readonly { kind: string }[]) =>
+  rateLimits.some(w => w.kind === 'five_hour' || w.kind === 'seven_day')
+
+const save = async ($: EngineInterface, rateLimits: SessionRateLimit[], cost: SessionCost | undefined) => {
+  // Only an API key's spend is real money; on a subscription it is notional.
+  const monthUsd = !isSubscription(rateLimits) && cost ? await recordMonth($, cost.usd) : null
+  await update($, usage, (): Usage => ({
     rateLimits: rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, resetsAt })),
     usd: cost?.usd ?? null,
+    monthUsd,
   }))
+}
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  const limit = Number(options.monthlyLimitUsd ?? 0)
+
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     const { rateLimits, cost } = await $.session.usage()
@@ -42,27 +71,52 @@ export const register: Register = on => {
   })
 
   // Subscription: the windows are what matters, the USD is only notional.
-  // API key: no windows come back, so the USD is the real bill.
+  // API key: the session's USD, and the month against its spend limit: the
+  // engine's `spend_limit` reading (what /usage shows) when it reports one,
+  // else this machine's own monthly total against `monthlyLimitUsd`.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
     if (e.props.hasSurvey || u === null || (u.rateLimits.length === 0 && u.usd === null)) return next(e)
 
     const now = await $.clock.now()
+    const isSub = isSubscription(u.rateLimits)
+    const spend = u.rateLimits.find(w => w.kind === 'spend_limit')
+    const windows = u.rateLimits.filter(w => w !== spend)
+    const monthPct = spend ? spend.percentUsed : limit > 0 && u.monthUsd !== null ? (u.monthUsd / limit) * 100 : null
+    const monthText = spend
+      ? ` ${spend.percentUsed}%` + (limit > 0 ? ` ≈${usd((spend.percentUsed / 100) * limit)} / ${usd(limit)}` : '')
+      : u.monthUsd === null
+        ? null
+        : ` ${usd(u.monthUsd)}` + (limit > 0 ? ` / ${usd(limit)} (${Math.round(monthPct ?? 0)}%)` : '')
     const { Box, Text } = $.ui.resolve(e)
 
     return (
       <Box justifyContent="flex-end" gap={2}>
-        {u.rateLimits.map(w => (
+        {windows.map(w => (
           <Box key={w.kind}>
             <Text color="suggestion" bold>{`${LABELS[w.kind] ?? w.kind} `}</Text>
-            <Text color={barColor(w.percentUsed)}>{FULL.repeat(filled(w.percentUsed))}</Text>
-            <Text color="inactive">{EMPTY.repeat(BAR - filled(w.percentUsed))}</Text>
+            <Text color={bar(w.percentUsed).color}>{bar(w.percentUsed).full}</Text>
+            <Text color="inactive">{bar(w.percentUsed).empty}</Text>
             <Text color="text">{` ${w.percentUsed}%`}</Text>
             <Text color="subtle">{resetIn(w.resetsAt, now)}</Text>
           </Box>
         ))}
-        {u.usd === null ? null : (
-          <Text color="claude">{u.rateLimits.length ? `≈${usd(u.usd)}` : `${usd(u.usd)} this session`}</Text>
+        {u.usd === null ? null : isSub ? (
+          <Text color="claude">{`≈${usd(u.usd)}`}</Text>
+        ) : (
+          <Box key="session">
+            <Text color="suggestion" bold>{'session '}</Text>
+            <Text color="claude">{usd(u.usd)}</Text>
+          </Box>
+        )}
+        {isSub || monthText === null ? null : (
+          <Box key="month">
+            <Text color="suggestion" bold>{'month '}</Text>
+            {monthPct === null ? null : <Text color={bar(monthPct).color}>{bar(monthPct).full}</Text>}
+            {monthPct === null ? null : <Text color="inactive">{bar(monthPct).empty}</Text>}
+            <Text color="text">{monthText}</Text>
+            {spend ? <Text color="subtle">{resetIn(spend.resetsAt, now)}</Text> : null}
+          </Box>
         )}
       </Box>
     )

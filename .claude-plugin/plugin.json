@@ -1,1 +1,14 @@
-{ "name": "c-cost", "version": "0.1.0", "description": "Live cost above the prompt: subscription window usage, or USD on API pricing", "types": "./types/index.d.ts" }
+{
+  "name": "c-cost",
+  "version": "0.1.0",
+  "description": "Live cost above the prompt: subscription window usage, or USD on API pricing",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "monthlyLimitUsd": {
+      "type": "number",
+      "title": "Monthly spend limit (USD)",
+      "description": "Your monthly API spend limit. With it the month bar shows dollars; without it, the percent the API reports (as /usage does), or this machine's month total.",
+      "default": 0
+    }
+  }
+}
