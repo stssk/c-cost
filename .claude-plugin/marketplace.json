@@ -1,0 +1,5 @@
+{
+  "name": "c-cost",
+  "owner": { "name": "Stian Sanden Skauge" },
+  "plugins": [{ "name": "c-cost", "source": "./" }]
+}

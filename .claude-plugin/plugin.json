@@ -1,0 +1,1 @@
+{ "name": "c-cost", "version": "0.1.0", "description": "Live cost above the prompt: subscription window usage, or USD on API pricing", "types": "./types/index.d.ts" }
