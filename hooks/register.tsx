@@ -70,22 +70,29 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // /clear starts a new session with no `session.start`: drop the old one's
+  // figures, so the line waits for the new session's first measure.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') await update($, usage, () => null)
+    return next(e)
+  })
+
   // Subscription: the windows are what matters, the USD is only notional.
   // API key: the session's USD, and the month against its spend limit: the
   // engine's `spend_limit` reading (what /usage shows) when it reports one,
   // else this machine's own monthly total against `monthlyLimitUsd`.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
-    if (e.props.hasSurvey || u === null || (u.rateLimits.length === 0 && u.usd === null)) return next(e)
+    if (e.props.hasSurvey || u === null || (u.rateLimits.length === 0 && u.usd == null)) return next(e)
 
     const now = await $.clock.now()
     const isSub = isSubscription(u.rateLimits)
     const spend = u.rateLimits.find(w => w.kind === 'spend_limit')
     const windows = u.rateLimits.filter(w => w !== spend)
-    const monthPct = spend ? spend.percentUsed : limit > 0 && u.monthUsd !== null ? (u.monthUsd / limit) * 100 : null
+    const monthPct = spend ? spend.percentUsed : limit > 0 && u.monthUsd != null ? (u.monthUsd / limit) * 100 : null
     const monthText = spend
       ? ` ${spend.percentUsed}%` + (limit > 0 ? ` ≈${usd((spend.percentUsed / 100) * limit)} / ${usd(limit)}` : '')
-      : u.monthUsd === null
+      : u.monthUsd == null
         ? null
         : ` ${usd(u.monthUsd)}` + (limit > 0 ? ` / ${usd(limit)} (${Math.round(monthPct ?? 0)}%)` : '')
     const { Box, Text } = $.ui.resolve(e)
@@ -101,7 +108,7 @@ export const register: Register = (on, options) => {
             <Text color="subtle">{resetIn(w.resetsAt, now)}</Text>
           </Box>
         ))}
-        {u.usd === null ? null : isSub ? (
+        {u.usd == null ? null : isSub ? (
           <Text color="claude">{`≈${usd(u.usd)}`}</Text>
         ) : (
           <Box key="session">
