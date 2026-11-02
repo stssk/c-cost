@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, SessionCost, SessionRateLimit } from 'claude-code'
 
-import type { Usage } from '../types'
+import type { AccountSpend, Usage } from '../types'
 
 const usage = atom({ plugin: 'c-cost', key: 'usage' } as const, null)
 
@@ -23,6 +23,62 @@ const barColor = (pct: number) => (pct >= 90 ? 'error' : pct >= 70 ? 'warning' :
 const bar = (pct: number) => ({ full: FULL.repeat(filled(pct)), empty: EMPTY.repeat(BAR - filled(pct)), color: barColor(pct) })
 
 const usd = (n: number) => `$${n.toFixed(n < 1 ? 3 : 2)}`
+const money = (n: number, currency: string) => (currency.toUpperCase() === 'USD' ? usd(n) : `${n.toFixed(2)} ${currency}`)
+
+// The first of next month, local time: when `/usage` says the month's spend resets.
+const nextMonth = (now: number) => {
+  const d = new Date(now)
+  return new Date(d.getFullYear(), d.getMonth() + 1, 1).toISOString()
+}
+
+// The account's spend this month, read where `/usage` reads it: claude.ai's
+// usage endpoint, its `extra_usage` block (amounts in cents). The engine sets
+// the session's own OAuth credential on the request; the plugin never sees it.
+// Null off a claude.ai login (an API key, a gateway, a cloud provider) or
+// where the plan has no extra usage turned on, as `/usage` shows nothing then.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+
+type ExtraUsage = {
+  is_enabled?: boolean
+  monthly_limit?: number | null
+  used_credits?: number | null
+  utilization?: number | null
+  currency?: string | null
+}
+
+const fetchAccount = async ($: EngineInterface): Promise<AccountSpend | null> => {
+  const auth = await $.session.authorize()
+  if (auth === null || auth.kind !== 'bearer') return null
+  const res = await $.http.fetch(USAGE_URL, {
+    auth: auth.handle,
+    headers: { 'Content-Type': 'application/json', 'anthropic-beta': 'oauth-2025-04-20' },
+  })
+  if (!res.ok) throw new Error(`GET /api/oauth/usage: ${res.status}`)
+  const x = (JSON.parse(res.text) as { extra_usage?: ExtraUsage | null }).extra_usage
+  if (!x || x.is_enabled !== true || typeof x.used_credits !== 'number') return null
+  const used = x.used_credits / 100
+  const limit = typeof x.monthly_limit === 'number' ? x.monthly_limit / 100 : null
+  const percentUsed =
+    typeof x.utilization === 'number' ? x.utilization : limit !== null && limit > 0 ? (used / limit) * 100 : null
+  return { used, limit, percentUsed, currency: x.currency ?? 'USD' }
+}
+
+// At most one read a minute: the line updates after every turn, and the
+// server's figure moves slower than that anyway.
+const REFRESH_MS = 60_000
+let lastFetchAt = 0
+
+const refreshAccount = async ($: EngineInterface, force = false) => {
+  const now = await $.clock.now()
+  if (!force && now - lastFetchAt < REFRESH_MS) return
+  lastFetchAt = now
+  try {
+    const account = await fetchAccount($)
+    await update($, usage, u => (u === null ? u : { ...u, account }))
+  } catch (err) {
+    $.ui.log(`c-cost: account usage unavailable: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+  }
+}
 
 type Month = { sessions: Record<string, number> }
 
@@ -48,10 +104,11 @@ const isSubscription = (rateLimits: readonly { kind: string }[]) =>
 const save = async ($: EngineInterface, rateLimits: SessionRateLimit[], cost: SessionCost | undefined) => {
   // Only an API key's spend is real money; on a subscription it is notional.
   const monthUsd = !isSubscription(rateLimits) && cost ? await recordMonth($, cost.usd) : null
-  await update($, usage, (): Usage => ({
+  await update($, usage, (prev): Usage => ({
     rateLimits: rateLimits.map(({ kind, percentUsed, resetsAt }) => ({ kind, percentUsed, resetsAt })),
     usd: cost?.usd ?? null,
     monthUsd,
+    account: prev?.account ?? null,
   }))
 }
 
@@ -62,11 +119,13 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     const { rateLimits, cost } = await $.session.usage()
     await save($, rateLimits, cost)
+    void refreshAccount($, true)
     return result
   })
 
   on('session.measure', async ($, e, next) => {
     await save($, e.rateLimits, e.cost)
+    if (e.changed.includes('cost')) void refreshAccount($)
     return next(e)
   })
 
@@ -78,23 +137,38 @@ export const register: Register = (on, options) => {
   })
 
   // Subscription: the windows are what matters, the USD is only notional.
-  // API key: the session's USD, and the month against its spend limit: the
-  // engine's `spend_limit` reading (what /usage shows) when it reports one,
-  // else this machine's own monthly total against `monthlyLimitUsd`.
+  // API key or a usage-billed seat: the session's USD, and the month: the
+  // engine's `spend_limit` reading (a gateway's), else the account's spend
+  // from claude.ai (what /usage shows on Team and Enterprise), else this
+  // machine's own monthly total against `monthlyLimitUsd`.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const u = await read($, usage)
-    if (e.props.hasSurvey || u === null || (u.rateLimits.length === 0 && u.usd == null)) return next(e)
+    const acct = u?.account ?? null
+    if (e.props.hasSurvey || u === null || (u.rateLimits.length === 0 && u.usd == null && acct === null)) return next(e)
 
     const now = await $.clock.now()
     const isSub = isSubscription(u.rateLimits)
     const spend = u.rateLimits.find(w => w.kind === 'spend_limit')
     const windows = u.rateLimits.filter(w => w !== spend)
-    const monthPct = spend ? spend.percentUsed : limit > 0 && u.monthUsd != null ? (u.monthUsd / limit) * 100 : null
+    // On a subscription the account's spend is its usage credits: shown once any is spent.
+    const account = acct !== null && (!isSub || acct.used > 0) ? acct : null
+    const acctLimit = account ? (account.limit ?? (limit > 0 ? limit : null)) : null
+    const monthPct = spend
+      ? spend.percentUsed
+      : account
+        ? (account.percentUsed ?? (acctLimit ? (account.used / acctLimit) * 100 : null))
+        : limit > 0 && u.monthUsd != null
+          ? (u.monthUsd / limit) * 100
+          : null
     const monthText = spend
       ? ` ${spend.percentUsed}%` + (limit > 0 ? ` ≈${usd((spend.percentUsed / 100) * limit)} / ${usd(limit)}` : '')
-      : u.monthUsd == null
-        ? null
-        : ` ${usd(u.monthUsd)}` + (limit > 0 ? ` / ${usd(limit)} (${Math.round(monthPct ?? 0)}%)` : '')
+      : account
+        ? ` ${money(account.used, account.currency)}` +
+          (acctLimit ? ` / ${money(acctLimit, account.currency)}` : ' spent')
+        : u.monthUsd == null
+          ? null
+          : ` ${usd(u.monthUsd)}` + (limit > 0 ? ` / ${usd(limit)} (${Math.round(monthPct ?? 0)}%)` : '')
+    const monthResets = spend ? spend.resetsAt : account ? nextMonth(now) : undefined
     const { Box, Text } = $.ui.resolve(e)
 
     return (
@@ -116,13 +190,13 @@ export const register: Register = (on, options) => {
             <Text color="claude">{usd(u.usd)}</Text>
           </Box>
         )}
-        {isSub || monthText === null ? null : (
+        {(isSub && !account) || monthText === null ? null : (
           <Box key="month">
             <Text color="suggestion" bold>{'month '}</Text>
             {monthPct === null ? null : <Text color={bar(monthPct).color}>{bar(monthPct).full}</Text>}
             {monthPct === null ? null : <Text color="inactive">{bar(monthPct).empty}</Text>}
             <Text color="text">{monthText}</Text>
-            {spend ? <Text color="subtle">{resetIn(spend.resetsAt, now)}</Text> : null}
+            {monthResets ? <Text color="subtle">{resetIn(monthResets, now)}</Text> : null}
           </Box>
         )}
       </Box>
